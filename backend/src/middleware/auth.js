@@ -9,11 +9,12 @@ function signToken(user) {
 
 function setSessionCookie(res, user) {
   const token = signToken(user)
+
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
-    sameSite: 'lax',
-    // secure should be true behind HTTPS in production; local dev runs on http.
-    secure: false,
+    secure: true,
+    sameSite: 'none',
+    path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000
   })
 }
