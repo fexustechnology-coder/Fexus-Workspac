@@ -6,3 +6,4 @@ dist
 backend/dev.db
 backend/*.db
 backend/*.db-journal
+.env.production
