@@ -1,0 +1,1524 @@
+// FEXUS Workspace — Robot Office Foundation schema
+// Real change for free Render deployment: PostgreSQL instead of SQLite.
+// Render's free web-service tier has no persistent disk — a SQLite
+// file would be wiped on every restart/spin-down (confirmed directly
+// against Render's own official docs) — while Render's free Postgres
+// genuinely persists real data. Status/role fields remain plain
+// strings (not native Postgres enums) — a deliberate, lower-risk
+// choice matching how they were already validated in the API layer
+// (src/lib/constants.js), avoiding a second, larger refactor this
+// deployment fix doesn't need.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         String   @default("user") // "owner" | "user" — owner is determined at signup by OWNER_EMAIL
+  createdAt    DateTime @default(now())
+
+  // Real, additive field — signup now requires real Gmail email
+  // verification (a real 6-digit code, see EmailVerificationCode below)
+  // before an account is usable. Defaults to false for genuinely new
+  // signups; existing accounts created before this feature keep working
+  // exactly as before (Owner is explicitly exempt from this + license
+  // gating at the login-route level, not via this field, since the
+  // Owner's own account has no one "above" them to verify/license it).
+  emailVerified Boolean @default(false)
+
+  // Phase 21 — Owner + User Workspace Unification. Each authenticated
+  // account (Owner or team member alike) gets its own fully isolated
+  // sender pool and campaign set — no shared pool, no owner dependency.
+  senderEmails   SenderEmail[]
+  emailCampaigns EmailCampaign[]
+  emailTemplates EmailTemplate[]
+  suppressedEmails SuppressedEmail[]
+  localAgentPairing LocalAgentPairing?
+  agentTasks AgentTask[]
+  pcControlLock PcControlLock?
+}
+
+// ---------------------------------------------------------------------------
+// Company Brain — Task 4. This is real and persisted, but it is a structured
+// business-information record, NOT AI logic. Nothing reads this to make
+// decisions yet; future AI modules will read from it once built (Task 5).
+// Singleton table: exactly one row, id = "singleton".
+// ---------------------------------------------------------------------------
+model CompanyBrain {
+  id               String   @id @default("singleton")
+  companyName      String   @default("")
+  industry         String   @default("")
+  services         String   @default("") // free text, one per line or comma-separated
+  products         String   @default("")
+  targetAudience   String   @default("")
+  mission          String   @default("")
+  vision           String   @default("")
+  goals            String   @default("")
+  coreValues       String   @default("") // free text, one per line — Phase 3 addition
+  brandVoice       String   @default("")
+  tone             String   @default("") // e.g. "Confident but approachable" — distinct from brandVoice: this is HOW it's said
+  writingStyle     String   @default("") // e.g. "Short sentences, active voice, no jargon"
+  pricing          String   @default("")
+  packages         String   @default("") // named packages/tiers, distinct from raw pricing notes
+  employeesNotes   String   @default("") // human notes; the live roster lives in Employee
+  clientsNotes     String   @default("") // human notes; day-to-day client records are a future module
+  workingHours     String   @default("")
+  processes        String   @default("")
+  rules            String   @default("")
+  customInstructions String @default("")
+  businessInfo     String   @default("") // catch-all for anything else
+  updatedAt        DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Company Operating Manual — Phase 3 continued. 30 permanent, versioned,
+// searchable sections (SOPs, policies, processes, standards, templates,
+// knowledge base, company direction). See src/brainSections.js for the
+// fixed list of section keys/titles/groups.
+//
+// Each BrainSection holds the CURRENT content. Every time it's edited, the
+// PREVIOUS content is archived into BrainSectionVersion before the update —
+// so BrainSection is always "latest", and BrainSectionVersion is history.
+// contentLower/titleLower mirror the searchable text in lowercase because
+// SQLite's Prisma provider doesn't support case-insensitive `contains`.
+// ---------------------------------------------------------------------------
+
+model BrainSection {
+  id           String   @id @default(cuid())
+  key          String   @unique // matches a key in src/brainSections.js
+  title        String
+  group        String   @default("")
+  content      String   @default("")
+  contentLower String   @default("") // lowercased mirror of `content`, for search
+  titleLower   String   @default("") // lowercased mirror of `title`, for search
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+  versions     BrainSectionVersion[]
+}
+
+model BrainSectionVersion {
+  id             String       @id @default(cuid())
+  sectionId      String
+  section        BrainSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  content        String       // the content as it was BEFORE this version's edit
+  editedByEmail  String       @default("")
+  createdAt      DateTime     @default(now())
+}
+
+model Department {
+  id        String     @id @default(cuid())
+  key       String     @unique // e.g. "website", "marketing", "sales"
+  name      String     // e.g. "Website Director"
+  employees Employee[]
+  createdAt DateTime   @default(now())
+}
+
+model Employee {
+  id           String   @id @default(cuid())
+  name         String
+  title        String   // "CEO", "Director", "Employee"
+  level        String   // "ceo" | "director" | "employee"
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  status       String   @default("idle") // "idle" | "walking" | "working" | "reporting"
+  responsibility String @default("") // Phase 6: the ONE fixed job this employee performs, e.g. "Instagram content and posting planning"
+  createdAt    DateTime @default(now())
+}
+
+// NOTE: the CEO/Director/Employee escalation workflow (formerly modeled by
+// a `Task` type here) and the per-employee queue (formerly `EmployeeTask`)
+// were merged into the Workflow Engine below (`Workflow` / `WorkflowStage`)
+// during a Phase 6.5.1 consolidation. Both duplicate models were removed
+// entirely — see CHANGELOG.md for the full migration notes. Company Office,
+// CEO Brain, Director Brains, and the Employee Office now all read/write
+// `Workflow`/`WorkflowStage` instead.
+
+
+// ---------------------------------------------------------------------------
+// Business Foundation — real, persisted business data. Every Workspace module
+// (Projects, Clients, Invoices, Marketing, Sales, SEO, Website Builder,
+// Automation) reads and writes here now instead of static demo arrays.
+// Company Brain (above) will become the single source of truth that
+// summarizes and reasons over this data in a later phase — these tables are
+// intentionally kept clean and independent so that connection is a read,
+// not a rewrite.
+// ---------------------------------------------------------------------------
+
+model Client {
+  id        String    @id @default(cuid())
+  name      String
+  contact   String    @default("")
+  email     String    @default("")
+  mrr       Float     @default(0)
+  status    String    @default("Active") // "Active" | "Churned"
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  projects  Project[]
+  invoices  Invoice[]
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  clientId  String?
+  client    Client?  @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  status    String   @default("Planning") // Planning | In Progress | Review | Completed
+  progress  Int      @default(0)
+  dueDate   String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Invoice {
+  id        String   @id @default(cuid())
+  number    String   @unique
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  amount    Float
+  status    String   @default("Pending") // Paid | Pending | Overdue
+  date      String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Campaign {
+  id        String   @id @default(cuid())
+  name      String
+  channel   String   @default("")
+  status    String   @default("Draft") // Draft | Scheduled | Live
+  reach     String   @default("—")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Deal {
+  id        String   @id @default(cuid())
+  name      String
+  stage     String   @default("Discovery") // Discovery | Proposal Sent | Negotiation | Closed Won
+  value     Float    @default(0)
+  owner     String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SeoAudit {
+  id        String   @id @default(cuid())
+  page      String
+  score     Int      @default(0)
+  issues    Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Site {
+  id        String   @id @default(cuid())
+  name      String
+  domain    String   @default("")
+  status    String   @default("Draft") // Draft | Live
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Automation {
+  id        String   @id @default(cuid())
+  name      String
+  trigger   String   @default("")
+  runs      Int      @default(0)
+  status    String   @default("Active") // Active | Paused
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Used only to compute a real Burn Rate on the Owner Dashboard/Analytics —
+// no AI logic, just a sum.
+model Expense {
+  id        String   @id @default(cuid())
+  label     String
+  amount    Float
+  createdAt DateTime @default(now())
+}
+
+// Added in Phase 4 so the CEO Dashboard can honestly report on meetings
+// instead of hardcoding zero. This is a Business Foundation table like
+// Client/Project/Invoice — CEO Brain only ever reads it, it never stores
+// anything of its own (see routes/ceo.js).
+model Meeting {
+  id          String   @id @default(cuid())
+  title       String
+  withWhom    String   @default("")
+  scheduledAt DateTime
+  createdAt   DateTime @default(now())
+}
+
+// Added in Phase 5 so the Sales Director can honestly read real lead data
+// instead of having nothing to report on. Business Foundation extension,
+// same precedent as Meeting in Phase 4 — Director Brains only ever read
+// these tables, never store anything of their own.
+// Extended in Phase 13 (Growth AI Department) — the Lead structure now
+// matches the full CRM spec: Company, Owner (contact person — the
+// original `name` field), Email, Phone, Website, Industry, Status,
+// Priority, Notes. The pipeline also changed to match the brief's stages;
+// existing rows with the old status values (Contacted/Qualified/Converted)
+// aren't migrated since SQLite has no enum to enforce — they just read as
+// plain text until updated, same as every other status field in this app.
+// Extended in Phase 15 (Real Autonomous AI Company) — Sales AI now runs a
+// real, client-facing conversation per lead (via a token-secured public
+// portal — see routes/salesPortal.js), collects requirements directly into
+// these fields, and can close a deal without the Owner clicking anything.
+model Lead {
+  id        String   @id @default(cuid())
+  name      String   // the Owner / contact person's name
+  company   String   @default("")
+  email     String   @default("")
+  phone     String   @default("")
+  website   String   @default("")
+  industry  String   @default("")
+  source    String   @default("") // e.g. "Referral", "Website Form", "Cold Outreach", "CSV Import"
+  status    String   @default("New") // New | Contacted | Interested | Meeting | Proposal | Won | Lost
+  priority  String   @default("Medium") // Critical | High | Medium | Low
+  notes     String   @default("")
+
+  // Phase 15 — collected by Sales AI's real conversation, or filled manually.
+  pages          String    @default("") // free text, e.g. "Home, About, Services, Contact"
+  style          String    @default("")
+  targetAudience String    @default("")
+  country        String    @default("")
+  budget         String    @default("")
+  businessType   String    @default("") // used to pick a Website AI websiteType
+  deadline       DateTime?
+
+  // Phase 15 — the public, token-secured client portal (routes/salesPortal.js).
+  // publicToken is unguessable but NOT a substitute for real authentication —
+  // anyone with the link can use it, by design, since it's meant to be shared
+  // with exactly one client.
+  publicToken     String? @unique
+  conversationLog String  @default("[]") // JSON: [{ sender: "client"|"sales_ai", content, at }]
+  dealClosedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Added in Phase 5 so the Support Director has real ticket data to read.
+// Same reasoning as Lead above. clientId is a plain reference (not a Prisma
+// relation) so this doesn't require adding a back-relation field to the
+// existing Client model — Business Foundation stays untouched.
+model SupportTicket {
+  id         String   @id @default(cuid())
+  subject    String
+  clientId   String?
+  status     String   @default("Open") // Open | In Progress | Resolved
+  priority   String   @default("Normal") // Low | Normal | High | Urgent
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 architecture prep — NOT implemented, NO AI logic.
+// This is separate from CompanyBrain above: CompanyBrain holds structured
+// business facts a person fills in; BrainMemory is reserved for whatever
+// unstructured context a future AI CEO/Brain generates on its own. Nothing
+// writes to it yet, and no decision-making reads from it. See
+// backend/src/routes/brain.js for the corresponding stub route.
+// ---------------------------------------------------------------------------
+model BrainMemory {
+  id        String   @id @default(cuid())
+  scope     String   // e.g. "company", "department:website", "task:<id>"
+  key       String
+  value     String   // JSON-encoded; shape is intentionally undefined pre-Phase 3
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scope, key])
+}
+
+// =============================================================================
+// PHASE 6.5 — WORKFLOW ENGINE V1
+// =============================================================================
+// As of the Phase 6.5.1 consolidation, this IS the single task system for
+// the whole app. It replaced two prior duplicate systems that used to live
+// here: the old `Task` model (CEO/Director escalation, Phase 2) and
+// `EmployeeTask` (per-employee queue, Phase 6) — both removed. Company
+// Office, CEO Brain, Director Brains, and the Employee Office all read and
+// write Workflow/WorkflowStage now. See CHANGELOG.md for the migration.
+//
+// All actor/assignee references (WorkflowHistory.actorLabel,
+// WorkflowStage.assigneeEmployeeId, etc.) are plain strings, not Prisma
+// relations to Employee/User — so this system adds zero fields to Employee,
+// User, Department, or any Business Foundation model.
+//
+// No enums (SQLite), same established pattern as everywhere else in this
+// schema — statuses/priorities are validated in the API layer
+// (backend/src/workflowConstants.js).
+// =============================================================================
+
+// A company-level task. Created by the CEO (in this phase: the Owner,
+// acting through the CEO Brain's authority — there is no autonomous CEO AI
+// yet) and assigned to exactly one Director's department.
+model Workflow {
+  id             String   @id @default(cuid())
+  title          String
+  description    String   @default("")
+  departmentKey  String   // which Director's department owns this
+  priority       String   @default("Medium") // Critical | High | Medium | Low
+  status         String   @default("Draft")  // see workflowConstants.js LIFECYCLE
+  startDate      DateTime?
+  dueDate        DateTime?
+  estimatedHours Float    @default(0)
+  actualHours    Float    @default(0)
+  createdByLabel String   @default("Owner (as CEO)")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  stages        WorkflowStage[]
+  history       WorkflowHistory[]
+  activities    WorkflowActivity[]
+  notifications WorkflowNotification[]
+}
+
+// A Director's breakdown of a Workflow into a concrete unit of work,
+// assigned to either the Director themself or one specific Employee.
+model WorkflowStage {
+  id                 String   @id @default(cuid())
+  workflowId         String
+  workflow           Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  title              String
+  description        String   @default("")
+  assigneeEmployeeId String?  // plain reference to Employee.id — director or employee
+  assigneeLabel      String   @default("") // denormalized display name, so this survives even if the employee row changes
+  priority           String   @default("Medium")
+  status             String   @default("Created") // see workflowConstants.js LIFECYCLE
+  order              Int      @default(0)
+  startDate          DateTime?
+  dueDate            DateTime?
+  estimatedHours     Float    @default(0)
+  actualHours        Float    @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  assignments  WorkflowAssignment[]
+  approvals    WorkflowApproval[]
+  history      WorkflowHistory[]
+  activities   WorkflowActivity[]
+  blockedBy    WorkflowDependency[] @relation("DependentStage")
+  blocks       WorkflowDependency[] @relation("BlockingStage")
+}
+
+// "Frontend cannot start until UI Design is complete" — dependentStage
+// cannot move to Working until blockingStage reaches Completed. Enforced
+// in routes/workflows.js, not just recorded.
+model WorkflowDependency {
+  id              String        @id @default(cuid())
+  blockingStageId String
+  blockingStage   WorkflowStage @relation("BlockingStage", fields: [blockingStageId], references: [id], onDelete: Cascade)
+  dependentStageId String
+  dependentStage  WorkflowStage @relation("DependentStage", fields: [dependentStageId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+
+  @@unique([blockingStageId, dependentStageId])
+}
+
+// Who is/was assigned to a stage, and by whom. Historical — reassigning
+// creates a new row rather than overwriting, so assignment history survives.
+model WorkflowAssignment {
+  id                 String        @id @default(cuid())
+  stageId            String
+  stage              WorkflowStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  assigneeEmployeeId String?
+  assigneeLabel      String
+  assignedByLabel    String
+  role               String        @default("employee") // "director" | "employee"
+  active             Boolean       @default(true)
+  createdAt          DateTime      @default(now())
+}
+
+// Immutable audit log — every lifecycle transition, with who/what/when/why.
+model WorkflowHistory {
+  id         String         @id @default(cuid())
+  workflowId String
+  workflow   Workflow       @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  stageId    String?
+  stage      WorkflowStage? @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  action     String         // e.g. "Created", "Assigned", "Accepted", "Started", "Paused", "Completed", "Approved", "Cancelled"
+  fromStatus String         @default("")
+  toStatus   String         @default("")
+  actorLabel String         // e.g. "Owner", "Marketing Director", "Instagram Employee"
+  department String         @default("")
+  reason     String         @default("")
+  createdAt  DateTime       @default(now())
+}
+
+// A free-form activity/notes feed — distinct from WorkflowHistory, which is
+// strictly structured status transitions. This is for context/comments.
+model WorkflowActivity {
+  id         String         @id @default(cuid())
+  workflowId String
+  workflow   Workflow       @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  stageId    String?
+  stage      WorkflowStage? @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  actorLabel String
+  message    String
+  createdAt  DateTime       @default(now())
+}
+
+// The approval chain: Employee submits → Director reviews → Director
+// approves/rejects → (if approved) CEO sees completion via the Workflow's
+// own status. Employees cannot mark a stage Completed directly — only
+// Approved, via this model, moves it there (enforced in routes/workflows.js).
+model WorkflowApproval {
+  id               String        @id @default(cuid())
+  stageId          String
+  stage            WorkflowStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  submittedByLabel String
+  submittedAt      DateTime      @default(now())
+  reviewedByLabel  String        @default("")
+  reviewedAt       DateTime?
+  status           String        @default("Pending") // Pending | Approved | Rejected
+  notes            String        @default("")
+}
+
+// Real notifications generated by real workflow events (assignment, review
+// requests, approvals, completions) — not a static/fake feed.
+model WorkflowNotification {
+  id                 String    @id @default(cuid())
+  workflowId         String
+  workflow           Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  recipientLabel     String    // e.g. "CEO", "Marketing Director", "Instagram Employee", "Owner"
+  recipientEmployeeId String?  // plain reference to Employee.id when recipient is a director/employee
+  message            String
+  type               String    @default("info") // info | review_requested | approved | rejected | blocked
+  read               Boolean   @default(false)
+  createdAt          DateTime  @default(now())
+}
+
+// =============================================================================
+// PHASE 7 — AUTOMATION ENGINE V1
+// =============================================================================
+// The execution layer, sitting downstream of the Workflow Engine. It reads
+// Workflow/WorkflowStage (to link a job to real completed employee work)
+// but NEVER writes to them, and neither of those models nor any of their
+// routes were touched to build this — see CHANGELOG.md.
+//
+// "Capability" values here are named job TYPES from a fixed list
+// (backend/src/automationModules.js), not executable actions. There is no
+// code path anywhere in this system that calls an external API, sends a
+// message, buys a domain, or deploys anything — every capability is
+// "Prepare X" / "Track X", and every job's lifecycle ends in a manually
+// entered `result` describing what was prepared, never what was executed.
+// =============================================================================
+
+model AutomationJob {
+  id             String   @id @default(cuid())
+  module         String   // one of AUTOMATION_MODULES keys, e.g. "website", "marketing"
+  capability     String   // one of that module's fixed capability names
+  status         String   @default("Queued") // Queued | Preparing | Ready | Executing | Completed | Failed | Cancelled
+  // Plain references (not Prisma relations) into the Workflow Engine and
+  // Employee roster — read-only links, so neither of those models needed
+  // any change to support this.
+  workflowId     String?
+  stageId        String?
+  departmentKey  String   @default("")
+  employeeLabel  String   @default("")
+  directorLabel  String   @default("")
+  result         String   @default("") // manually entered description of what was PREPARED, never "executed"
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  logs AutomationLog[]
+}
+
+// Every step of a job's lifecycle, logged — timestamp, module, linked
+// workflow, employee, director, result, and status, exactly as specified.
+model AutomationLog {
+  id            String        @id @default(cuid())
+  jobId         String
+  job           AutomationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  module        String
+  workflowId    String?
+  employeeLabel String        @default("")
+  directorLabel String        @default("")
+  status        String        // the status this log entry recorded
+  result        String        @default("")
+  message       String        @default("")
+  createdAt     DateTime      @default(now())
+}
+
+// =============================================================================
+// PHASE 8 — MEMORY ENGINE V1
+// =============================================================================
+// Temporary working memory for an Employee actively working one
+// WorkflowStage. It exists ONLY while that stage is open. Permanent company
+// knowledge always stays in Company Brain, the Operating Manual, Business
+// Foundation, and the Workflow Engine — none of which were modified to
+// build this. This model only ever READS those systems to populate
+// snapshot fields; it never writes back to them.
+//
+// No vector database, no embeddings, no RAG, no LLM memory, no autonomous
+// agents. Every field below is plain structured data (mostly JSON-encoded
+// strings, same no-enum pattern used everywhere in this schema) — there is
+// no reasoning, retrieval, or AI decision-making anywhere in this model or
+// its routes (backend/src/routes/memoryEngine.js).
+// =============================================================================
+model EmployeeMemory {
+  id            String   @id @default(cuid())
+  employeeId    String   // plain reference to Employee.id — no relation, no schema change to Employee
+  employeeLabel String   @default("")
+  workflowId    String?  // plain reference — read-only link into the Workflow Engine
+  stageId       String?
+
+  status String @default("Created") // Created | Loaded | Updated | Saved Temporarily | Expired
+
+  // 1. Task Memory — a snapshot taken at load time, not a live subscription.
+  taskTitle     String    @default("")
+  taskObjective String    @default("")
+  directorLabel String   @default("")
+  priority      String    @default("")
+  dueDate       DateTime?
+
+  // 2. Context Memory — snapshots only; this is a cached COPY, never the
+  // live record. Editing these fields is not exposed via the API at all.
+  companyBrainSnapshot    String @default("") // JSON: a subset of Company Brain fields
+  operatingManualSnapshot String @default("") // JSON: [{ title, content }] for relevant sections
+  clientProfileSnapshot   String @default("") // JSON: client info, if the linked workflow has one
+
+  // 3. Conversation Memory — recent WorkflowHistory/WorkflowActivity for
+  // this workflow, snapshotted, refreshable via POST .../refresh-conversation.
+  conversationSnapshot String @default("") // JSON: [{ actorLabel, message, at }]
+
+  // 4. Working Memory — the ONLY part an employee "writes" to. Free-form,
+  // temporary, deleted with the rest of the row when work finishes.
+  workingNotes   String @default("")
+  fileReferences String @default("[]") // JSON: [{ label, url }] — references only, no upload/storage
+
+  // 5. Resource Memory — linked, never duplicated. Just labeled URLs.
+  resourceLinks String @default("[]") // JSON: [{ label, url, type }]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Survives even after its EmployeeMemory row is deleted — memoryId is a
+// plain string, not a relation, specifically so the audit trail outlives
+// the memory itself ("only workflow history remains" applied to memory).
+model MemoryLog {
+  id            String   @id @default(cuid())
+  memoryId      String
+  employeeLabel String   @default("")
+  action        String   // Created | Loaded | Updated | Expired | Deleted
+  message       String   @default("")
+  createdAt     DateTime @default(now())
+}
+
+// =============================================================================
+// PHASE 9 — INTEGRATION LAYER V1
+// =============================================================================
+// A centralized registry of external-service CONNECTOR PLACEHOLDERS. This is
+// the only place any future connection to an outside service would ever be
+// wired up — no AI Employee, Director, or Automation job talks to an
+// external service directly. Today, nothing in this model or its routes
+// (backend/src/routes/integrationLayer.js) calls a real API, requests a
+// token, performs OAuth, or stores a credential of any kind. `authKind` and
+// `configuration` are descriptive placeholder text, never secrets.
+// =============================================================================
+model Connector {
+  id            String   @id @default(cuid())
+  key           String   @unique // matches a key in src/integrationConnectors.js
+  name          String   // provider display name, e.g. "GitHub"
+  category      String   // website | marketing | sales | seo | finance | support | automation
+  status        String   @default("Disconnected") // Connected | Disconnected | Coming Soon — a LABEL only, never a real connection
+  version       String   @default("v0.1.0-framework")
+  authKind      String   @default("") // descriptive only, e.g. "OAuth 2.0" — never an actual credential
+  configuration String   @default("{}") // JSON placeholder describing what config WOULD look like
+  health        String   @default("Unknown") // Healthy | Unavailable | Unknown — a LABEL only, no real health check is performed
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  logs ConnectorLog[]
+}
+
+model ConnectorLog {
+  id          String    @id @default(cuid())
+  connectorId String
+  connector   Connector @relation(fields: [connectorId], references: [id], onDelete: Cascade)
+  action      String    // e.g. "Status changed", "Health updated"
+  message     String    @default("")
+  createdAt   DateTime  @default(now())
+}
+
+// =============================================================================
+// PHASE 10 — WEBSITE AI V1 (the first real AI Employee)
+// =============================================================================
+// One row per website PLAN. Website AI reads Company Brain, the Operating
+// Manual, Business Foundation, the Workflow Engine, and the Memory Engine —
+// all read-only, via each system's own existing functions/queries — and
+// never writes back to any of them. It never stores permanent memory of
+// its own beyond this plan record; temporary context comes from the
+// Memory Engine's existing loadMemory(), referenced here only by id.
+//
+// The 8 "modules" in the brief (Requirements Analyzer, Page Planner,
+// Section Planner, Component Planner, Design Planner, Responsive Planner,
+// Asset Manager, Deployment Planner) are the 8 fields below, all populated
+// together by one grounded generation call (routes/websiteAI.js
+// generatePlan()) rather than eight separate ones — simpler, and easier to
+// keep honest that none of them ever emits real HTML/React/Tailwind/
+// Next.js code (checked defensively — see codeGuard() in that file).
+// =============================================================================
+model WebsiteProject {
+  id              String   @id @default(cuid())
+  workflowId      String?  // plain reference — read-only link into the Workflow Engine
+  stageId         String?
+  memoryId        String?  // plain reference to an EmployeeMemory row loaded via the existing Memory Engine
+  automationJobId String?  // plain reference, set once sent to the Automation Engine
+
+  employeeLabel String @default("")
+  directorLabel String @default("")
+  clientLabel   String @default("")
+
+  websiteType String @default("Business Website")
+  status      String @default("Planning") // see websiteAIConstants.js STATUSES
+
+  requirementsText     String @default("") // input — what the Owner/Director asked for
+  requirementsAnalysis String @default("") // 1. Requirements Analyzer output
+
+  pages      String @default("[]") // 2. Page Planner — JSON: [{ name, purpose }]
+  sections   String @default("[]") // 3. Section Planner — JSON: [{ name, usedOn }]
+  components String @default("[]") // 4. Component Planner — JSON: [{ name, description }]
+
+  designPlan     String @default("{}") // 5. Design Planner — JSON: { colors, typography, spacing, darkMode, lightMode }
+  responsivePlan String @default("")   // 6. Responsive Planner — text notes on breakpoints/layout behavior
+
+  assetPlan String @default("[]") // 7. Asset Manager — JSON: [{ label, type, source }] — LINKED only, from Memory Engine's Resource Memory, never duplicated
+
+  projectStructure String @default("") // 8a. Deployment Planner (part 1) — described folder/project structure, plain text, not real files
+  deploymentPlan   String @default("") // 8b. Deployment Planner (part 2) — described steps, references Integration Layer connector NAMES only
+
+  // Phase 11 — Website AI V2, Execution Manager additions. Purely additive
+  // to this, Website AI's OWN model — not a change to any protected system.
+  currentPhase      String @default("") // one of WEBSITE_PHASES names, or "" before execution starts
+  qualityChecklist  String @default("[]") // JSON: [{ name, checked }] — the 7 framework checklist items
+
+  // Phase 12 — Website AI V3. Real code generation + a publish flow that
+  // must never run automatically. All additive to this, Website AI's own
+  // model — not a change to any protected system.
+  codeStack        String    @default("") // one of CODE_STACKS — "" until code is generated
+  generatedFiles   String    @default("[]") // JSON: [{ path, content }] — the actual generated files
+  codeGeneratedAt  DateTime?
+  codeGenMode      String    @default("") // "free" (deterministic scaffold) | "ai" (real LLM generation)
+  publishRequested Boolean   @default(false) // Owner clicked "Publish Website" — awaiting the Y/N confirmation
+  publishConfirmed Boolean   @default(false) // Owner explicitly said YES — only then is an AutomationJob created
+  deploymentProvider String  @default("") // one of DEPLOYMENT_PROVIDERS keys — intent only, nothing is deployed
+  apiUsageLog      String    @default("[]") // JSON: [{ action, inputTokens, outputTokens, at }] — real token counts, for honest cost visibility
+
+  // Phase 15 — Real Autonomous AI Company. Additive to this, Website AI's
+  // own model — links a plan back to the Lead/deal that produced it (when
+  // created by the autonomous handoff instead of a manual "New Plan" click),
+  // and gives every plan a real, servable preview URL.
+  leadId        String?  // plain reference to the Lead this was auto-generated from
+  autoGenerated Boolean  @default(false) // true if created by runAutoHandoff(), never by a manual click
+  previewToken  String?  @unique // powers GET /preview/:token — see routes/preview.js
+  deploymentSiteId String @default("") // the Netlify site id (or Vercel project name) from the real deploy — needed for later domain attachment
+
+  // Phase 23 — Design Options (Part 17). designConcepts stores 3-4 real,
+  // distinct AI-generated concept summaries (JSON array) for the Owner to
+  // choose between; selectedDesignConcept is the one actually chosen (or
+  // a description derived from an imported reference), and gets fed into
+  // generatePlanCore()'s existing prompt as extra grounding — it does not
+  // replace or duplicate the planning system, just informs it.
+  designSource          String @default("") // "generated" | "imported" | "" (not yet chosen)
+  designConcepts        String @default("[]") // JSON: [{ name, style, colors, typography, description }]
+  selectedDesignConcept String @default("") // JSON of the chosen concept object, or a plain description for an imported reference
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  phases WebsitePhase[]
+}
+
+// Maps one project's 10 execution phases to the REAL WorkflowStage created
+// for each — Website AI never bypasses the Workflow Engine; every phase is
+// an actual WorkflowStage row, assigned to a real existing Website
+// Department employee. This model just remembers which stage is which
+// phase, in what order, since WorkflowStage itself (a protected model) was
+// not given a "phase name" field.
+model WebsitePhase {
+  id        String         @id @default(cuid())
+  projectId String
+  project   WebsiteProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  stageId   String         // plain reference to the real WorkflowStage for this phase
+  phaseName String
+  order     Int
+  createdAt DateTime       @default(now())
+}
+
+// =============================================================================
+// PHASE 13 — GROWTH AI DEPARTMENT (Marketing + Sales combined)
+// =============================================================================
+// ONE model covers all 14 generation types the brief asks for (campaigns,
+// posts, captions, hashtags, ads, email campaigns, content calendars,
+// strategy, proposals, quotations, outreach, follow-ups, meeting agendas/
+// notes/reminders, closing messages) — a `type` discriminator instead of
+// 14 near-identical tables. Every row goes through the same approval gate
+// before anything could ever be "sent" (nothing actually sends — see
+// routes/growth.js) and the same Free/Paid generation split as Website AI.
+// =============================================================================
+model GrowthContent {
+  id            String    @id @default(cuid())
+  type          String    // campaign | post | caption | hashtags | ad | email_campaign | content_calendar | strategy | proposal | quotation | outreach | follow_up | meeting_agenda | meeting_notes | meeting_reminder | closing_message
+  channel       String    @default("") // Instagram | LinkedIn | Facebook | Email | WhatsApp | X | "" (not channel-specific)
+  leadId        String?   // plain reference to a Lead
+  campaignId    String?   // plain reference to a Business Foundation Campaign
+  meetingId     String?   // plain reference to a Business Foundation Meeting
+  workflowStageId String? // plain reference — optionally linked to a real Workflow Engine stage
+  memoryId      String?   // plain reference to an EmployeeMemory row, if one was loaded
+
+  title         String    @default("")
+  content       String    @default("") // the generated text/JSON body
+  generationMode String   @default("") // "free" (deterministic template) | "ai" (real Gemini call)
+
+  status        String    @default("Draft") // Draft | Pending Approval | Approved | Rejected
+  approvedAt    DateTime?
+  sentAt        DateTime? // framework only — set manually by the Owner, never by a real send
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// =============================================================================
+// PHASE 15 — REAL AUTONOMOUS AI COMPANY
+// =============================================================================
+// Three new, small, purely additive models. No existing model's meaning
+// changed — Lead and WebsiteProject were extended above, not altered.
+// =============================================================================
+
+// A single connected Gmail account (the Owner's own), used to send real
+// email via the Gmail API. One row, singleton-style (id = "singleton").
+// Tokens are real OAuth2 tokens — see backend/src/lib/gmail.js.
+model GmailAccount {
+  id           String   @id @default("singleton")
+  email        String   @default("")
+  accessToken  String   @default("")
+  refreshToken String   @default("")
+  expiresAt    DateTime?
+  connectedAt  DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// =============================================================================
+// PHASE 18 — COMPANY EMAIL SYSTEM (multi-sender)
+// =============================================================================
+// The single GmailAccount row above still serves the general "connect
+// Gmail" flow used by Sales AI, scheduled follow-ups, and team invites —
+// untouched, per this phase's "keep existing Gmail OAuth" instruction.
+// This is a separate, additive pool specifically for the Campaign
+// System's sender rotation: unlimited real sender addresses, each with
+// its own real OAuth connection (the same OAuth mechanism, applied per
+// address, not a new send mechanism).
+// =============================================================================
+model SenderEmail {
+  id           String    @id @default(cuid())
+  // Phase 21 — each sender belongs to exactly one authenticated user
+  // (Owner or team member) and is never visible to any other account.
+  // Uniqueness is now scoped per user (not global) — two different users
+  // must each be able to connect the same shared inbox address
+  // independently, since there is no shared pool at all.
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email        String
+  displayName  String    @default("")
+  // Phase 22 — professional Reply-To support. When set, every real send
+  // from this sender carries a real Reply-To header, so customer replies
+  // land in a different inbox than the sending address (e.g. sales@
+  // sends, but replies route to support@). Validated with the same real
+  // syntax check as the sender address itself (lib/emailVerification.js).
+  replyToEmail String    @default("")
+
+  // Phase 18: real OAuth2 tokens for this specific address. Phase 19:
+  // connectionMethod distinguishes which of the two real connection paths
+  // this sender uses — OAuth alone was not enough for bulk/non-Gmail
+  // addresses (sales@, support@, custom domains), so manual SMTP is now a
+  // real, equally-first-class alternative, not a fallback.
+  connectionMethod String @default("oauth") // "oauth" | "smtp"
+  accessToken  String    @default("")
+  refreshToken String    @default("")
+  expiresAt    DateTime?
+  connectedAt  DateTime?
+
+  // Phase 19 — real manual SMTP credentials (lib/smtp.js). Never returned
+  // by any API response (see routes/senders.js) — the password is at
+  // rest in this SQLite file as plaintext, which is an honest, stated
+  // limitation for this MVP; a real production deployment should put
+  // this behind a proper secrets manager / KMS-backed encryption layer,
+  // not this database column directly.
+  smtpHost       String @default("")
+  smtpPort       Int    @default(587)
+  smtpUsername   String @default("")
+  smtpPassword   String @default("")
+  smtpEncryption String @default("starttls") // "none" | "ssl" | "starttls"
+  // Deliverability audit — TLS certificate validation is ON by default
+  // (secure). This is a real, explicit, per-sender opt-out for private/
+  // self-hosted SMTP servers running self-signed certificates — never a
+  // silent default, and never something this code decides on its own.
+  allowInsecureTls Boolean @default(false)
+  provider       String @default("") // "Gmail" | "Google Workspace" | "Outlook" | "Microsoft 365" | "Zoho" | "Private SMTP" | "Custom Domain"
+
+  // Real verification (lib/emailVerification.js) — syntax, domain, MX
+  // records, disposable-provider rejection, best-effort SMTP RCPT TO
+  // check, and (Phase 19, for connectionMethod "smtp") a real SMTP AUTH
+  // test against the credentials actually provided. Only a Verified
+  // address can become Active.
+  verificationStatus String @default("Pending") // Pending | Verified | Failed
+  verificationDetail String @default("") // human-readable reason, e.g. "MX record missing" or "disposable provider"
+
+  active           Boolean  @default(false) // Owner's own on/off switch — separate from verification
+  connectionStatus String   @default("Disconnected") // Connected | Disconnected | Error
+  health           String   @default("Unknown") // Healthy | Degraded | Unavailable | Unknown
+  lastUsedAt       DateTime?
+  lastError        String   @default("")
+
+  // Phase 19 (task 4) — real daily usage tracking, sender-scoped (distinct
+  // from a campaign's own dailyLimit) so the Connected Emails list can
+  // show real per-sender volume, not just per-campaign.
+  dailyUsage     Int       @default(0)
+  dailyUsageDate DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaignLinks EmailCampaignSender[]
+
+  @@unique([userId, email])
+}
+
+// Which senders ONE campaign rotates through, in what order, and each
+// sender's real per-campaign usage — the join table that makes round-robin
+// rotation (task 6) and per-sender failure isolation (task 7) real and
+// independently trackable, without polluting SenderEmail's own
+// account-wide health/status.
+model EmailCampaignSender {
+  id         String        @id @default(cuid())
+  campaignId String
+  campaign   EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  senderId   String
+  sender     SenderEmail   @relation(fields: [senderId], references: [id])
+  order      Int // real, fixed round-robin position for this campaign
+  sentCount  Int           @default(0) // cumulative sends via this sender, this campaign
+  status     String        @default("Healthy") // Healthy | Unavailable
+  lastError  String        @default("")
+
+  @@unique([campaignId, senderId])
+}
+
+// Real scheduled email — checked by a real in-process interval
+// (backend/src/lib/emailScheduler.js) and sent for real via Gmail once
+// `sendAt` has passed. This is genuine scheduling, not a label: as long as
+// the backend process is running, the email goes out at the requested time.
+model ScheduledEmail {
+  id        String    @id @default(cuid())
+  leadId    String?
+  to        String
+  subject   String
+  body      String
+  kind      String    @default("follow_up") // proposal | quotation | preview_ready | revision_request | approval_request | follow_up | final_delivery
+  sendAt    DateTime
+  status    String    @default("Scheduled") // Scheduled | Sent | Failed | Cancelled
+  sentAt    DateTime?
+  error     String    @default("")
+  createdAt DateTime  @default(now())
+}
+
+// One global on/off switch per AI department for autonomous behavior. Off
+// by default — the Owner must deliberately enable it, per the brief
+// ("once the Owner has enabled autonomous mode"). Singleton row.
+model AutonomousSettings {
+  id                String   @id @default("singleton")
+  salesAutonomous   Boolean  @default(false)
+  growthAutonomous  Boolean  @default(false)
+  updatedAt         DateTime @updatedAt
+}
+
+// =============================================================================
+// PHASE 16 — PRODUCTION PAYMENT INFRASTRUCTURE
+// =============================================================================
+// Real Stripe + PayFast integration (backend/src/lib/payments.js) — no
+// framework-only placeholder. Every one of these models is written to,
+// read from, and updated by real API calls and real webhook handlers.
+// Until STRIPE_SECRET_KEY / PAYFAST_MERCHANT_ID etc. are set, every
+// payment action returns an honest "not configured" error — nothing here
+// ever fakes a successful payment.
+// =============================================================================
+
+// The FEXUS platform's own subscription tiers — matches the Free/Pro/
+// Premium architecture already established in Phase 12 (websiteAIConstants
+// PLAN_TIERS), now backed by real prices instead of labels only.
+model PaymentPlan {
+  id            String  @id @default(cuid())
+  key           String  @unique // "free" | "pro" | "premium"
+  name          String
+  priceMonthly  Float   @default(0)
+  priceYearly   Float   @default(0)
+  currency      String  @default("usd")
+  features      String  @default("[]") // JSON string array
+  stripePriceIdMonthly String @default("") // set once a real Stripe Price is created for this plan
+  stripePriceIdYearly  String @default("")
+  active        Boolean @default(true)
+}
+
+// The Owner's own FEXUS platform subscription. Singleton — one workspace,
+// one subscription. Kept separate from PaymentTransaction (below) so
+// "am I subscribed and to what" is a simple, direct read.
+model Subscription {
+  id                   String    @id @default("singleton")
+  planKey              String    @default("free")
+  billingCycle         String    @default("monthly") // monthly | yearly
+  status               String    @default("Active") // Active | PastDue | Cancelled | Incomplete
+  provider             String    @default("") // "stripe" once a real subscription exists
+  stripeCustomerId     String    @default("")
+  stripeSubscriptionId String    @default("")
+  currentPeriodEnd     DateTime?
+  updatedAt            DateTime  @updatedAt
+}
+
+// Every real payment attempt — platform subscription checkout AND
+// one-time client project payments (Sales AI's "Payment Ready" step) share
+// this one model, distinguished by `kind`. This is the transaction/
+// payment-history/invoice record all at once — a real audit trail, not a
+// UI label.
+model PaymentTransaction {
+  id            String    @id @default(cuid())
+  kind          String    // "subscription" | "project"
+  provider      String    // "stripe" | "payfast"
+  amount        Float
+  currency      String    @default("usd")
+  status        String    @default("Pending") // Pending | Success | Failed | Cancelled | Refunded
+  leadId        String?   // plain reference — set for "project" kind payments
+  planKey       String    @default("") // set for "subscription" kind payments
+  billingCycle  String    @default("") // "monthly" | "yearly", for subscription kind
+  externalId    String    @default("") // Stripe Checkout Session id / PayFast payment id
+  checkoutUrl   String    @default("")
+  invoiceNumber String    @default("") // e.g. INV-000123, generated on creation
+  webhookLog    String    @default("[]") // JSON: [{ event, receivedAt, raw }] — a real record of every webhook this transaction received
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// =============================================================================
+// PHASE 17 — SETTINGS MODULE (real persistence)
+// =============================================================================
+// One singleton row for every simple preference across the Company,
+// Workspace, Appearance, Security, and Notifications tabs — the same
+// established "singleton settings row" pattern already used by
+// AutonomousSettings/Subscription/GmailAccount. Company Brain remains the
+// place for AI-grounding business facts; this is lightweight account
+// and workspace configuration, exactly as the UI already told the Owner.
+// =============================================================================
+model WorkspaceSettings {
+  id String @id @default("singleton")
+
+  // Company tab
+  companyName     String @default("")
+  companyWebsite  String @default("")
+  companyIndustry String @default("")
+  companySize     String @default("")
+
+  // Workspace tab
+  defaultLandingPage  Boolean @default(true)
+  compactSidebar      Boolean @default(false)
+  showComingSoonPages Boolean @default(true)
+
+  // Appearance tab
+  theme String @default("light") // "light" | "dark" | "system"
+
+  // Security tab
+  twoFactorEnabled     Boolean @default(false)
+  ssoEnabled           Boolean @default(false)
+  sessionTimeoutEnabled Boolean @default(true)
+
+  // Notifications tab
+  billingAlerts       Boolean @default(true)
+  projectUpdates      Boolean @default(true)
+  aiWorkforceUpdates  Boolean @default(false)
+  weeklySummaryEmail  Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+}
+
+// Real team invites — the Users tab. Signed-up team members are already
+// real (the existing User model); this covers the "invited but hasn't
+// signed up yet" state, with a real token so a future accept-invite flow
+// has something to check.
+model TeamInvite {
+  id        String   @id @default(cuid())
+  email     String
+  role      String   @default("Member") // "Member" | "Admin"
+  status    String   @default("Pending") // Pending | Accepted | Revoked
+  token     String   @unique
+  emailSent Boolean  @default(false) // true only if a real Gmail send succeeded
+  createdAt DateTime @default(now())
+}
+
+// Real API keys — the full key is shown exactly once at creation and only
+// its bcrypt hash is ever stored, the same real pattern used for User
+// passwords elsewhere in this app. keyPrefix is what's shown afterward
+// ("fx_live_a1b2...") so the Owner can tell keys apart without the app
+// ever being able to show the full value again.
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String
+  keyPrefix  String    // safe to display, e.g. "fx_live_a1b2"
+  keyHash    String    // bcrypt hash of the full key — never store plaintext
+  revoked    Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+}
+
+// =============================================================================
+// PHASE 17 — ADVANCED GMAIL CAMPAIGN SYSTEM
+// =============================================================================
+// Built entirely on top of the EXISTING Gmail integration
+// (backend/src/lib/gmail.js's sendEmail()) — nothing here reimplements
+// OAuth or the send call itself, only orchestrates real, sequential,
+// rate-limited sending through it. See backend/src/campaignEngine.js.
+//
+// Named "EmailCampaign" (not "Campaign") specifically because a `Campaign`
+// model already exists (Business Foundation / Growth AI's Campaign
+// Manager, Phase 2) — this is a deliberately distinct system, mounted at
+// a distinct route (/api/email-campaigns, not /api/campaigns), so the
+// existing Campaign model and its routes/campaigns.js were never touched.
+// =============================================================================
+
+model EmailCampaign {
+  id       String @id @default(cuid())
+  // Phase 21 — each campaign belongs to exactly one authenticated user,
+  // same isolation model as SenderEmail above.
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name     String
+  status   String @default("Draft") // Draft | Running | Paused | Completed | Cancelled | Failed
+
+  subject   String @default("")
+  body      String @default("") // supports {{company}} {{email}} {{date}} placeholders
+  signature String @default("")
+
+  delayMode    String @default("fixed") // "fixed" | "random"
+  delaySeconds Int    @default(45)
+  delayMin     Int    @default(30)
+  delayMax     Int    @default(60)
+
+  dailyLimit   Int      @default(100)
+  sentToday    Int      @default(0)
+  lastSendDate DateTime? // used to detect a new day and reset sentToday
+
+  retryLimit Int @default(2)
+
+  // Phase 18 — Sender Rotation Engine. When emailsPerSender is 0, the
+  // campaign sends entirely through the single connected Gmail account,
+  // exactly as it did in Phase 17 (backward compatible, no rotation).
+  // Above 0, it round-robins across the campaign's linked SenderEmail
+  // rows, this many sends per sender before switching.
+  emailsPerSender Int @default(0)
+
+  // Phase 23 — Multi-Template Rotation. When emailsPerTemplate is 0 (or
+  // no templates are attached), the campaign sends its own subject/body
+  // above, exactly as before — fully backward compatible, no regression.
+  // Above 0, template assignment is a PURE FUNCTION of a contact's fixed
+  // `order` and this number — never separate mutable "current template"
+  // state — so pause/resume is inherently correct with zero extra
+  // recovery logic: the same contact always maps to the same template,
+  // regardless of when it's actually sent.
+  emailsPerTemplate Int @default(0)
+
+  // Phase 23 — real open tracking, opt-in per campaign (requires HTML
+  // email + a real tracking pixel, a real change to the MIME body — see
+  // campaignEngine.js). Off by default so existing plain-text campaigns
+  // are completely unaffected unless explicitly enabled.
+  trackOpens Boolean @default(false)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  emails     EmailCampaignContact[]
+  logs       EmailCampaignLog[]
+  statistics EmailCampaignStatistics?
+  queue      EmailCampaignQueue?
+  senders    EmailCampaignSender[]
+  templates  EmailCampaignTemplate[]
+}
+
+// Phase 23 — one or more templates per campaign, in a fixed, real order.
+// `order` (0-indexed) is what getTemplateForOrder() uses, together with
+// campaign.emailsPerTemplate, to deterministically compute which
+// template any given contact (by its own fixed `order`) receives.
+model EmailCampaignTemplate {
+  id         String        @id @default(cuid())
+  campaignId String
+  campaign   EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  order      Int // fixed rotation position — 0, 1, 2, ...
+  name       String @default("")
+  subject    String @default("")
+  body       String @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  contacts EmailCampaignContact[]
+}
+
+// The imported contact list — one row per recipient, real CSV/manual
+// import, real per-email status through the whole send lifecycle.
+model EmailCampaignContact {
+  id             String        @id @default(cuid())
+  campaignId     String
+  campaign       EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email          String
+  personalization String       @default("{}") // JSON — extra CSV columns beyond "email", e.g. { "company": "Acme" }
+  status         String        @default("Pending") // Pending | Sending | Sent | Failed | Retry | Skipped
+  attempts       Int           @default(0)
+  lastError      String        @default("")
+  sentAt         DateTime?
+  order          Int           @default(0)
+
+  // Phase 23 — which template was ACTUALLY used, recorded at send time
+  // (never inferred after the fact — the brief is explicit about this:
+  // "store the relationship at send time, don't infer it later"). Null
+  // until sent, or always null for a campaign with no templates attached.
+  templateId String?
+  template   EmailCampaignTemplate? @relation(fields: [templateId], references: [id])
+
+  // Phase 23 — real open tracking. trackingId is a cryptographically
+  // random, non-predictable token (crypto.randomBytes, not a guessable
+  // sequential id), generated at send time and embedded in this
+  // specific contact's tracking pixel URL — never the campaignId or
+  // recipient email exposed in a public URL. openedAt is a denormalized
+  // "first open" convenience field for fast unique-open counts; every
+  // individual open (including repeats) is also recorded in
+  // EmailOpenEvent for the Total Opens vs Unique Opens distinction.
+  trackingId String?   @unique
+  openedAt   DateTime?
+  openEvents EmailOpenEvent[]
+  // Deliverability audit — a real, non-guessable per-recipient token
+  // (crypto.randomBytes) generated at send time, embedded in the real
+  // List-Unsubscribe header/link. Never the contact's own row id (which
+  // would let anyone unsubscribe anyone else just by guessing ids).
+  unsubscribeToken String? @unique
+  // the same campaign (whether from a repeated row in one CSV, or across
+  // two separate import calls for a large file split into batches) —
+  // enforced at the database level, not just checked in application code,
+  // so it holds even under concurrent batch imports.
+  @@unique([campaignId, email])
+}
+
+// Phase 23 — every individual open event, real and timestamped. This is
+// what makes "Unique Opens" (distinct contacts) vs "Total Opens" (every
+// event, including repeats) a real distinction rather than an assumption
+// — EmailCampaignContact.openedAt alone could only ever answer "did they
+// open," never "how many times."
+model EmailOpenEvent {
+  id         String   @id @default(cuid())
+  contactId  String
+  contact    EmailCampaignContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  campaignId String // denormalized — real campaign-level open queries without joining through contact every time
+  templateId String? // denormalized at write-time from the contact's own templateId, for real template-level open analytics without a second lookup
+  openedAt   DateTime @default(now())
+  userAgent  String   @default("")
+  ip         String   @default("")
+}
+
+// =============================================================================
+// PHASE 23 — License System (Part 27-31)
+// =============================================================================
+// Owner-only management (never exposed to clients for generation).
+// `licenseId` is the real, cryptographically random credential a client
+// enters at login — deliberately a SEPARATE field from `id` (the internal
+// DB primary key), generated with crypto.randomBytes, never a sequential
+// or guessable value. `id` is never shown to anyone; `licenseId` is what
+// the Owner hands to a client after receiving payment manually (Part 30
+// — no online payment gate in this MVP).
+// =============================================================================
+// =============================================================================
+// PHASE 24 (extension) — FEXUS Local PC Agent pairing + permissions
+// =============================================================================
+// One row per authenticated account, representing whether a Local Agent
+// process (running on the Owner's own machine, NOT this backend) is
+// paired and what it's allowed to do. The backend NEVER trusts a command
+// just because it came from the frontend — every relay to the Local
+// Agent re-checks these real, stored permissions first.
+// =============================================================================
+// Real email-verification codes for the regular User signup flow (not
+// the separate ClientAccount/License-portal flow above). A real,
+// random 6-digit code, single-use, rate-limited by real attempt
+// counting and a real expiry — not hashed, matching how real OTP codes
+// are commonly stored (low entropy either way; the real protection is
+// expiry + attempt-limiting, not the storage format, and hashing a
+// 6-digit code adds negligible real security over that).
+model EmailVerificationCode {
+  id        String   @id @default(cuid())
+  userId    String   @unique // one real, current pending code per user — a new signup/resend overwrites the previous one
+  code      String
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model LocalAgentPairing {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pairingToken String   @unique // shared secret between this backend and the Local Agent — real, random, never guessable
+  agentUrl     String   @default("http://localhost:9911") // where the Local Agent's own server listens, on the SAME machine
+  connected    Boolean  @default(false)
+  lastSeenAt   DateTime?
+
+  // Real, explicit, per-directory permissions — off by default. The
+  // Local Agent itself also enforces its own ALLOWED_DIRECTORIES config
+  // (defense in depth: two independent checks, not one).
+  allowDesktop       Boolean @default(false)
+  allowDocuments     Boolean @default(false)
+  allowDownloads     Boolean @default(false)
+  allowFexusWorkspace Boolean @default(false)
+
+  // Real, explicit, per-capability permissions — off by default.
+  allowOpenFiles        Boolean @default(false)
+  allowOpenFolders      Boolean @default(false)
+  allowOpenApplications Boolean @default(false)
+  allowOpenUrls         Boolean @default(false)
+  allowReadMetadata     Boolean @default(false)
+  allowShutdown         Boolean @default(false)
+  allowRestart          Boolean @default(false)
+  allowMouseControl     Boolean @default(false)
+  allowKeyboardControl  Boolean @default(false)
+  allowWriteFiles       Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  actions PcActionLog[]
+}
+
+// Real, complete audit log — every relayed PC action, whether it
+// succeeded or failed, and whether confirmation was required. Never logs
+// file contents or credentials.
+model PcActionLog {
+  id           String            @id @default(cuid())
+  pairingId    String
+  pairing      LocalAgentPairing @relation(fields: [pairingId], references: [id], onDelete: Cascade)
+  action       String            // e.g. "OPEN_FILE", "SHUTDOWN"
+  target       String   @default("") // e.g. a file path or URL — never credentials
+  source       String   @default("Voice Agent")
+  confirmationRequired Boolean @default(false)
+  confirmed    Boolean  @default(false)
+  result       String   @default("") // "Success" | "Failed" | error summary
+  createdAt    DateTime @default(now())
+}
+
+// =============================================================================
+// FEXUS AGENT TASK ORCHESTRATION (Master Computer-Use Spec)
+// =============================================================================
+// The real, persistent backbone for long-running, multi-step tasks: a
+// saved plan, per-step execution/verification, and real checkpoints so a
+// task survives a crash/disconnect and can genuinely resume rather than
+// restart. This is a NEW layer sitting above the existing single-shot
+// Voice Agent dispatch (voiceAgent.js) — simple one-action commands
+// still go through the fast, existing path unchanged; only commands
+// that decompose into a real multi-step plan create an AgentTask.
+// =============================================================================
+model AgentTask {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  goal             String    // the real, original natural-language goal
+  status           String    @default("QUEUED") // QUEUED|PLANNING|RUNNING|WAITING_APPROVAL|WAITING_DEPENDENCY|PAUSED|COMPLETED|FAILED
+  priority         String    @default("Normal") // Normal | High
+  plan             String    @default("[]") // JSON array of {order, description, actionType, actionParams} — saved once, real planning output
+  currentStepIndex Int       @default(0)
+  result           String    @default("") // real final result summary, only set once genuinely COMPLETED
+  error            String    @default("") // real failure reason, only set if genuinely FAILED
+  dependsOnTaskId  String?   // real task dependency — this task can't run until the referenced one completes
+  retryCount       Int       @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  completedAt      DateTime?
+
+  steps       AgentTaskStep[]
+  checkpoints AgentTaskCheckpoint[]
+}
+
+model AgentTaskStep {
+  id            String     @id @default(cuid())
+  taskId        String
+  task          AgentTask  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  order         Int
+  description   String     // real, human-readable — shown directly in the live timeline
+  actionType    String     // maps to one real, executable action — never an arbitrary string the LLM can invent unchecked
+  actionParams  String     @default("{}")
+  status        String     @default("PENDING") // PENDING|RUNNING|VERIFYING|SUCCESS|FAILED|SKIPPED
+  result        String     @default("")
+  error         String     @default("")
+  startedAt     DateTime?
+  completedAt   DateTime?
+}
+
+// A checkpoint is written after EVERY meaningful step — this is what
+// makes "resume" a real capability rather than a restart: on resume, the
+// task continues from the last real checkpoint's stepIndex, not step 0.
+model AgentTaskCheckpoint {
+  id          String    @id @default(cuid())
+  taskId      String
+  task        AgentTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  stepIndex   Int
+  description String
+  currentUrl  String    @default("")
+  currentFile String    @default("")
+  output      String    @default("")
+  createdAt   DateTime  @default(now())
+}
+
+// Real mutex — only one AgentTask may control the physical mouse/
+// keyboard/PC at a time. A second task requesting PC control while this
+// is held waits (WAITING_FOR_PC_CONTROL), it does not queue a
+// conflicting action underneath the one already running.
+model PcControlLock {
+  id           String    @id @default(cuid())
+  userId       String    @unique
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  heldByTaskId String?
+  acquiredAt   DateTime?
+}
+
+model License {
+  id            String    @id @default(cuid())
+  licenseId     String    @unique
+  assignedEmail String
+  status        String    @default("INACTIVE") // ACTIVE | INACTIVE | REVOKED
+  plan          String    @default("")
+  createdAt     DateTime  @default(now())
+  activatedAt   DateTime?
+  deactivatedAt DateTime?
+  expiresAt     DateTime?
+  revokedAt     DateTime? // once set, this license can never be re-activated — a genuinely new license must be generated instead
+  emailSentAt   DateTime? // real send timestamp for the "your License ID" email — null if it was never successfully sent (e.g. Gmail not connected)
+}
+
+// Phase 23 (revised) — a real client account, separate from both the
+// Owner/User model (middleware/auth.js) and the License record itself.
+// A client SIGNS UP here first (real password, hashed the same way as
+// every other account in this app); logging in afterward additionally
+// requires a real, active License matched to the same email — the
+// account existing is not enough on its own.
+model ClientAccount {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+}
+
+// =============================================================================
+// DELIVERABILITY AUDIT — Suppression List (Phase 10)
+// =============================================================================
+// Real, persistent, cross-campaign memory: once an address hard-bounces
+// or unsubscribes, it is never emailed again by this account, in ANY
+// future campaign — not just skipped for the rest of the current one.
+// Checked before every real send in campaignEngine.js.
+// =============================================================================
+model SuppressedEmail {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email     String
+  reason    String   // "hard_bounce" | "unsubscribed" | "manual"
+  detail    String   @default("") // the real SMTP response or context that caused this
+  createdAt DateTime @default(now())
+
+  @@unique([userId, email])
+}
+
+// A full, real, timestamped log of every campaign event — what the Live
+// Logs panel and Download Logs export both read from.
+model EmailCampaignLog {
+  id         String        @id @default(cuid())
+  campaignId String
+  campaign   EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email      String        @default("") // the recipient this log line is about, if any
+  event      String        // "Campaign Started" | "Email Sent" | "Waiting" | "Email Failed" | "Campaign Paused" | ...
+  message    String        @default("")
+  createdAt  DateTime      @default(now())
+}
+
+// A real, persisted snapshot — updated by the same function that changes
+// an email's status (one place owns "when status changes, update stats"),
+// so this can never drift from EmailCampaignContact's real rows. Exists as
+// its own table (rather than only computed live) so Campaign History can
+// show a fast, stable summary of a long-finished campaign without
+// re-scanning every contact row every time.
+model EmailCampaignStatistics {
+  campaignId  String        @id
+  campaign    EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  loaded      Int           @default(0)
+  sent        Int           @default(0)
+  failed      Int           @default(0)
+  retried     Int           @default(0)
+  skipped     Int           @default(0)
+  updatedAt   DateTime      @updatedAt
+}
+
+// The scheduler's own real runtime state for one campaign — distinct from
+// EmailCampaignContact (which tracks each recipient) and
+// EmailCampaignStatistics (which tracks totals). This is what makes
+// Automatic Recovery real: on backend restart, campaignEngine.js reads
+// every Running campaign's EmailCampaignQueue row and resumes exactly
+// where it left off, with no progress lost, because every bit of state
+// driving the loop was already in the database, not in memory.
+model EmailCampaignQueue {
+  campaignId     String        @id
+  campaign       EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  isProcessing   Boolean       @default(false) // a real lock so overlapping ticks can't double-send
+  nextSendAt     DateTime?
+  currentEmailId String?
+  // Phase 18 — the real, recoverable rotation pointer. Both fields are
+  // read and written by campaignEngine.js on every send; on restart, the
+  // engine resumes rotation from exactly these values — nothing about
+  // "whose turn it is" lives only in memory.
+  currentSenderId        String?
+  currentSenderSentCount Int     @default(0)
+  updatedAt      DateTime      @updatedAt
+}
+
+// =============================================================================
+// PHASE 22 — Email Templates
+// =============================================================================
+// Only CUSTOM templates (created from scratch, or "Duplicate"d from a
+// built-in one) ever get a row here. Built-in templates (the 20+ starter
+// library) are deliberately NOT seeded into the database — they live as
+// real, editable-once-duplicated constants in
+// backend/src/emailTemplates.js, served read-only alongside these real
+// rows by routes/emailTemplates.js. This avoids needing to seed static
+// content into every fresh install while keeping "Duplicate" a real,
+// simple copy operation.
+// =============================================================================
+model EmailTemplate {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category  String   @default("Custom")
+  name      String
+  subject   String   @default("")
+  body      String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+
+
+

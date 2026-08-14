@@ -1,0 +1,17 @@
+{
+  "name": "fexus-local-agent",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.0.0 <21.0.0"
+  },
+  "description": "Runs on the user's own Windows PC. Exposes an explicit allowlisted set of local actions to the FEXUS backend over an authenticated localhost connection — never a general shell or unrestricted filesystem access.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
