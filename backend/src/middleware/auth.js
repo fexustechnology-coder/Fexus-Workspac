@@ -10,6 +10,10 @@ function signToken(user) {
 function setSessionCookie(res, user) {
   const token = signToken(user)
 
+  console.log('[AUTH] Setting session cookie')
+  console.log('[AUTH] JWT_SECRET exists:', !!process.env.JWT_SECRET)
+  console.log('[AUTH] User:', user.email)
+
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
     secure: true,
